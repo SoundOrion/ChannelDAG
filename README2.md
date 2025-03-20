@@ -264,3 +264,191 @@ await connection.PublishAsync("my.subject", "Hello from connection pool!");
 | **接続プール (`poolSize > 1`)** | 複数の接続を効率よく管理 |
 
 💡 **基本的には `AddNats` で登録し、コンストラクタインジェクションで利用するのがシンプルでおすすめ！**
+
+
+NATSサーバーが起動していない場合にエラーが発生するのを防ぐ方法はいくつかあります。  
+以下のような対策を講じることで、アプリの起動を妨げないようにできます。
+
+---
+
+## **🔹 方法 1: `Try-Catch` でエラーハンドリング**
+`AddNats` で `NatsConnection` を登録する際に、NATS サーバーが起動していなくてもアプリが落ちないように `Try-Catch` を使う方法です。
+
+```csharp
+var services = new ServiceCollection();
+
+services.AddNats(configureOpts: opts => opts with { Url = "nats://localhost:4222" });
+
+var serviceProvider = services.BuildServiceProvider();
+
+// NATS サーバーが起動しているか確認
+try
+{
+    var nats = serviceProvider.GetRequiredService<INatsConnection>();
+    Console.WriteLine("✅ NATS に接続しました！");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"⚠️ NATS に接続できません: {ex.Message}");
+}
+```
+**📝 この方法のポイント**
+- NATS サーバーがダウンしていても、エラーがキャッチされ、アプリが落ちるのを防ぐ。
+- ただし、後続の処理で NATS を利用する際にエラーになる可能性があるので、適切に `null` チェックを行う必要がある。
+
+---
+
+## **🔹 方法 2: `HealthCheck` を導入して遅延接続**
+`Microsoft.Extensions.Diagnostics.HealthChecks` を使って、NATS の接続状態をチェックし、起動時に必ず接続しようとせずに、動的に接続する方法。
+
+### **① `IHealthCheck` を実装**
+```csharp
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using NATS.Client.Core;
+
+public class NatsHealthCheck : IHealthCheck
+{
+    private readonly INatsConnection _nats;
+
+    public NatsHealthCheck(INatsConnection nats)
+    {
+        _nats = nats;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _nats.PingAsync(); // NATS の Ping を送信
+            return HealthCheckResult.Healthy("NATS サーバーに接続可能");
+        }
+        catch
+        {
+            return HealthCheckResult.Unhealthy("NATS サーバーに接続できません");
+        }
+    }
+}
+```
+
+### **② DI に登録**
+```csharp
+services.AddNats(configureOpts: opts => opts with { Url = "nats://localhost:4222" });
+
+// ヘルスチェックを追加
+services.AddHealthChecks()
+        .AddCheck<NatsHealthCheck>("NATS Health Check");
+```
+
+**📝 この方法のポイント**
+- アプリが起動する際に NATS の接続状態をチェックできる。
+- `HealthCheck` の結果を使って、NATS サーバーが起動したら接続するようにできる。
+
+---
+
+## **🔹 方法 3: `Lazy` インスタンス化で遅延接続**
+NATS の接続を **遅延評価 (`Lazy<T>`)** にすることで、NATS サーバーが利用されるタイミングで初めて接続を試みる方法。
+
+### **① DI に登録**
+```csharp
+services.AddSingleton(provider =>
+{
+    return new Lazy<INatsConnection>(() =>
+    {
+        try
+        {
+            var nats = provider.GetRequiredService<INatsConnection>();
+            Console.WriteLine("✅ NATS に接続しました！");
+            return nats;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️ NATS に接続できません: {ex.Message}");
+            return null;
+        }
+    });
+});
+```
+
+### **② 遅延接続**
+```csharp
+var lazyNats = serviceProvider.GetRequiredService<Lazy<INatsConnection>>();
+
+if (lazyNats.Value != null)
+{
+    await lazyNats.Value.PublishAsync("my.subject", "Hello, NATS!");
+}
+```
+**📝 この方法のポイント**
+- `Lazy<T>` を使うことで、実際に NATS を使うタイミングで接続を試みる。
+- 起動時には NATS への接続チェックを行わないため、アプリの起動が遅れない。
+
+---
+
+## **🔹 方法 4: `BackgroundService` で再接続リトライ**
+アプリ起動時に NATS がダウンしていても、一定間隔で再接続を試みる方法。
+
+### **① `NatsReconnectService` を作成**
+```csharp
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using NATS.Client.Core;
+
+public class NatsReconnectService : BackgroundService
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<NatsReconnectService> _logger;
+
+    public NatsReconnectService(IServiceProvider serviceProvider, ILogger<NatsReconnectService> logger)
+    {
+        _serviceProvider = serviceProvider;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using (var scope = _serviceProvider.CreateScope())
+                {
+                    var nats = scope.ServiceProvider.GetRequiredService<INatsConnection>();
+                    await nats.PingAsync(); // NATS に接続できるか確認
+                    _logger.LogInformation("✅ NATS に接続しました！");
+                    return; // 成功したらループを抜ける
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"⚠️ NATS に接続できません。再試行します: {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); // 5秒後に再試行
+        }
+    }
+}
+```
+
+### **② DI に登録**
+```csharp
+services.AddHostedService<NatsReconnectService>();
+```
+**📝 この方法のポイント**
+- `BackgroundService` を使って、一定間隔で NATS への接続を再試行する。
+- NATS サーバーがダウンしていてもアプリが落ちない。
+
+---
+
+## **🚀 まとめ**
+| 方法 | メリット | デメリット |
+|------|--------|--------|
+| **① `Try-Catch` を使う** | 簡単に実装できる | 利用時にエラーになる可能性あり |
+| **② `HealthCheck` を使う** | NATS の状態を監視できる | 初回の接続は必要 |
+| **③ `Lazy<T>` で遅延評価** | NATS を使うタイミングまで接続を遅らせる | `null` チェックが必要 |
+| **④ `BackgroundService` で再試行** | NATS がダウンしていても自動で再接続 | 実装がやや複雑 |
+
+**💡 おすすめの方法**
+- **`BackgroundService` を使ったリトライ (`④`)** を導入すると、NATS がダウンしていても起動後に接続を試みるため、システム全体が安定します。
+- `Lazy<T>` を使う (`③`) のも良い選択肢で、NATS が必要なタイミングでのみ接続を試みるようにできます。
+
+これで **NATS サーバーがダウンしていても、アプリがクラッシュしない仕組み** を作れます！🚀
