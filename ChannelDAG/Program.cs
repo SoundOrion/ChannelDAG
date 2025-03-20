@@ -35,7 +35,7 @@ class DAGNode
             Console.WriteLine($"[Node {nodeName}] Received: {message}");
 
             // ノードの処理（シミュレーション: 5秒待機）
-            await Task.Delay(5000);
+            await Task.Delay(500);
 
             if (dependencyChannel != null)
             {
