@@ -415,3 +415,18 @@ DAG Execution Started. Press Enter to exit.
 この修正によって、**DAGの依存関係を正しく管理しながら、非同期処理をスムーズに動作させることが可能** になりました！
 
 このコードなら、**NATSを使わずに完全なDAGの非同期ワークフローを実現できます** 🎯🔥
+
+
+
+
+        // Register NatsConnectionPool, NatsConnection, INatsCommand to ServiceCollection
+        services.AddNats(
+            configureOpts: opts => opts with { Url = "nats://localhost:4222" }
+        );
+
+        services.AddNats(
+    poolSize: 5,  // 接続プールのサイズ
+    configureOpts: opts => opts with { Name = "MyNatsConnection" },
+    configureConnection: conn => Console.WriteLine("NATS Connection Created"),
+    key: "customNats"
+);
