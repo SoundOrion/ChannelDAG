@@ -452,3 +452,117 @@ services.AddHostedService<NatsReconnectService>();
 - `Lazy<T>` を使う (`③`) のも良い選択肢で、NATS が必要なタイミングでのみ接続を試みるようにできます。
 
 これで **NATS サーバーがダウンしていても、アプリがクラッシュしない仕組み** を作れます！🚀
+
+
+では、**BackgroundService を使って NATS サーバーへの再接続を自動で試行する方法** を詳しく説明します。  
+この方法では、**アプリが起動しても NATS サーバーがダウンしている場合に、一定間隔で再接続を試みる** ようにします。
+
+---
+
+## **🚀 実装手順**
+1. **NATS の依存性注入 (DI) を設定**
+2. **BackgroundService を作成**
+3. **DI に `BackgroundService` を登録**
+
+---
+
+## **① NATS の DI 設定**
+まず、`IServiceCollection` に NATS を登録します。
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using NATS.Client.Core;
+
+var services = new ServiceCollection();
+
+// NATS を DI に登録
+services.AddNats(configureOpts: opts => opts with { Url = "nats://localhost:4222" });
+
+// BackgroundService を登録
+services.AddHostedService<NatsReconnectService>();
+
+// DI コンテナを構築
+var serviceProvider = services.BuildServiceProvider();
+```
+
+---
+
+## **② `BackgroundService` を作成**
+以下の `NatsReconnectService` は、**NATS に接続できるまで 5 秒ごとに再試行** するバックグラウンドタスクです。
+
+```csharp
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using NATS.Client.Core;
+
+public class NatsReconnectService : BackgroundService
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<NatsReconnectService> _logger;
+
+    public NatsReconnectService(IServiceProvider serviceProvider, ILogger<NatsReconnectService> logger)
+    {
+        _serviceProvider = serviceProvider;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using (var scope = _serviceProvider.CreateScope()) // スコープを作成
+                {
+                    var nats = scope.ServiceProvider.GetRequiredService<INatsConnection>();
+                    await nats.PingAsync(); // NATS サーバーへの疎通確認
+
+                    _logger.LogInformation("✅ NATS に接続しました！");
+                    return; // 成功したらループを抜ける
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"⚠️ NATS に接続できません。5 秒後に再試行します: {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); // 5 秒待って再試行
+        }
+    }
+}
+```
+
+---
+
+## **③ DI に `BackgroundService` を登録**
+さきほどの `AddHostedService<NatsReconnectService>()` を DI に追加して、バックグラウンドサービスとして登録します。
+
+```csharp
+services.AddHostedService<NatsReconnectService>();
+```
+
+これで、NATS サーバーが起動していない場合でも、5 秒ごとに接続を試みるようになります。
+
+---
+
+## **④ サービスの利用**
+NATS が接続された後、通常どおり `INatsConnection` を使うことができます。
+
+```csharp
+using (var scope = serviceProvider.CreateScope())
+{
+    var nats = scope.ServiceProvider.GetRequiredService<INatsConnection>();
+
+    // NATS にメッセージを送信
+    await nats.PublishAsync("my.subject", "Hello, NATS!");
+}
+```
+
+---
+
+## **✨ まとめ**
+✅ **アプリ起動時に NATS がダウンしていてもエラーにならない**  
+✅ **バックグラウンドで 5 秒ごとに NATS への接続を試みる**  
+✅ **NATS に接続できたら通常どおり `INatsConnection` を利用可能**  
+
+この方法なら、**NATS サーバーがダウンしていてもアプリが落ちず、自動で接続を試みて復旧できる** ので安心ですね！ 🚀
